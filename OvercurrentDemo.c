@@ -141,7 +141,7 @@ int main(void)
     set_forward();
 
     /* Small startup grace so motor can begin before we enforce limit */
-    __delay_cycles(1000000);  /* ~1s at 1 MHz */
+    __delay_cycles(100000);  /* ~1s at 1 MHz */
 
     // Motors run indefinitely, stop if overcurrent
     while (1) {
