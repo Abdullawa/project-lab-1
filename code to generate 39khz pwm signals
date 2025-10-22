@@ -25,7 +25,7 @@ int main(void)
     /*** Timer0_A Setup ***/
     // Using SMCLK (≈8 MHz) and counting to 104 for ~38 kHz:
     // f = 8e6 / (2 * 104) ≈ 38,462 Hz (toggle each interrupt)
-    TA0CCR0 = 91.5;                   // Period for ~38 kHz toggle rate
+    TA0CCR0 = 92;                   // Period for ~38 kHz toggle rate
     TA0CCTL0 = CCIE;                 // Enable Timer_A CCR0 interrupt
     TA0CTL = TASSEL__SMCLK | MC__UP; // SMCLK source, Up mode
 
