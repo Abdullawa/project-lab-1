@@ -1,0 +1,48 @@
+#include <msp430fr6989.h>
+
+volatile int Control = 0;
+
+int main(void)
+{
+    /*** Stop watchdog and configure clock ***/
+    WDTCTL = WDTPW | WDTHOLD; // Stop watchdog timer
+
+    // Configure DCO for ~1 MHz
+    CSCTL0_H = CSKEY_H;                   // Unlock CS registers
+    CSCTL1 = DCOFSEL_5;                   // DCO = 5 MHz
+    CSCTL2 = SELS__DCOCLK | SELM__DCOCLK; // SMCLK & MCLK from DCO
+    CSCTL3 = DIVS__1 | DIVM__1;           // SMCLK = MCLK = DCO / 1
+    CSCTL0_H = 0;                         // Lock CS registers
+
+    /*** GPIO Setup ***/
+    PM5CTL0 &= ~LOCKLPM5; // Unlock GPIO (FR-series requirement)
+
+    P2DIR |= BIT7;  // P2.7 = Red LED (or output pin)
+    P2OUT &= ~BIT7; // Start OFF
+
+    P9DIR |= BIT7;  // P9.7 = Green LED
+    P9OUT &= ~BIT7; // Start OFF
+
+    /*** Timer0_A Setup ***/
+    TA0CCR0 = 91.5;                  // Timer counts up to 3000
+    TA0CCTL0 = CCIE;                 // Enable Timer_A CCR0 interrupt
+    TA0CTL = TASSEL__SMCLK | MC__UP;  // Use ACLK, Up mode
+
+    /*** Enter Low Power Mode with interrupts ***/
+    __bis_SR_register(LPM0_bits | GIE);
+    __no_operation(); // For debugger
+}
+
+/*** Timer0_A0 Interrupt Service Routine ***/
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer0_A0_ISR(void)
+{
+    Control++;
+    P2OUT ^= BIT7; // Toggle P2.7 (Red output pin)
+
+    if (Control == 4)
+    {
+        P9OUT ^= BIT7; // Toggle Green LED on P9.7
+        Control = 0;
+    }
+}
