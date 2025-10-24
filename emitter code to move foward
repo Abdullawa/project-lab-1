@@ -6,7 +6,7 @@
 #define CYCLES_0_MARK     16u
 #define CYCLES_1_MARK     32u
 #define CYCLES_GAP        25u
-#define FRAME_GAP_MS      60u
+#define FRAME_GAP_MS      80u
 
 /* ===== Clock and Carrier ===== */
 #define SMCLK_HZ          7000000UL
