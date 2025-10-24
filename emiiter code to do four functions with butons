@@ -1,0 +1,143 @@
+#include <msp430fr6989.h>
+
+/* ===== User Config ===== */
+static volatile unsigned char CMD_NIBBLE = 0x1u;  // default command (Forward)
+#define CYCLES_0_MARK     16u
+#define CYCLES_1_MARK     32u
+#define CYCLES_GAP        25u
+#define FRAME_GAP_MS      60u
+
+/* ===== Clock and Carrier ===== */
+#define SMCLK_HZ          7000000UL
+#define CARRIER_HZ        38000UL
+#define TA0_CCR0_VALUE    91u
+#define GAP_US            658u
+
+/* ===== Button Pins (Active HIGH) ===== */
+#define BTN_FWD   BIT3   // P1.3 → Forward
+#define BTN_LEFT  BIT0   // P3.0 → Left
+#define BTN_RIGHT BIT1   // P3.1 → Right
+#define BTN_BACK  BIT3   // P2.3 → Backward
+
+/* ===== Globals ===== */
+static volatile unsigned int  toggles_left = 0;
+static volatile unsigned char emitting      = 0;
+static volatile unsigned char bits_sent     = 0;
+
+/* ===== Clock init (~7 MHz) ===== */
+static void clock_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_5;                   // DCO ~7 MHz
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK; // SMCLK & MCLK from DCO
+    CSCTL3   = DIVS__1 | DIVM__1;
+    CSCTL0_H = 0;
+}
+
+/* ===== GPIO ===== */
+static void gpio_init(void)
+{
+    PM5CTL0 &= ~LOCKLPM5;
+
+    // IR LED output (P3.3)
+    P3DIR  |=  BIT3;
+    P3OUT  &= ~BIT3;
+
+    // Buttons (no pull-ups since external voltage applied)
+    P1DIR  &= ~BTN_FWD;
+    P3DIR  &= ~(BTN_LEFT | BTN_RIGHT);
+    P2DIR  &= ~BTN_BACK;
+}
+
+/* ===== TimerA0 → 38 kHz toggling ===== */
+static void timerA0_init(void)
+{
+    TA0CCR0  = TA0_CCR0_VALUE;
+    TA0CCTL0 = 0;
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+/* ===== TimerB0 → 1 µs scheduler ===== */
+static void timerB0_init(void)
+{
+    TB0CTL   = TBSSEL__SMCLK | ID__8 | MC__CONTINUOUS | TBCLR; // 1 MHz ticks
+    TB0CCTL0 = 0;
+}
+
+/* ===== Helper Routines ===== */
+static inline void start_burst_for_bit(unsigned char bit)
+{
+    toggles_left = (unsigned int)((bit ? CYCLES_1_MARK : CYCLES_0_MARK) * 2u);
+    emitting = 1u;
+    TA0CCTL0 = CCIE;  // enable 38 kHz toggling ISR
+}
+
+static inline void tb0_schedule_us(unsigned int us)
+{
+    TB0CCR0  = (unsigned int)(TB0R + us);
+    TB0CCTL0 = CCIE;
+}
+
+/* ===== ISRs ===== */
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void TA0_CCR0_ISR(void)
+{
+    if (emitting) {
+        P3OUT ^= BIT3;
+        if (toggles_left && --toggles_left == 0) {
+            emitting  = 0;
+            TA0CCTL0  = 0;
+            P3OUT    &= ~BIT3;       // idle LOW
+            tb0_schedule_us(GAP_US); // quiet gap
+        }
+    } else {
+        P3OUT &= ~BIT3;
+    }
+}
+
+#pragma vector = TIMER0_B0_VECTOR
+__interrupt void TB0_CCR0_ISR(void)
+{
+    TB0CCTL0 &= ~CCIFG;
+
+    if (bits_sent < 4u) {
+        unsigned char bit = (unsigned char)((CMD_NIBBLE >> (3 - bits_sent)) & 1u);
+        bits_sent++;
+        start_burst_for_bit(bit);
+    } else {
+        bits_sent = 0u;
+        tb0_schedule_us((unsigned int)(FRAME_GAP_MS * 1000u));
+    }
+}
+
+/* ===== Main ===== */
+int main(void)
+{
+    clock_init();
+    gpio_init();
+    timerA0_init();
+    timerB0_init();
+    __enable_interrupt();
+
+    tb0_schedule_us(50u); // Start first emission soon
+
+    for (;;) 
+    {
+        // Button logic (active HIGH)
+        if (P1IN & BTN_FWD) { 
+            CMD_NIBBLE = 0x1u;   // Forward
+        }
+        else if (P3IN & BTN_LEFT) { 
+            CMD_NIBBLE = 0x5u;   // Left
+        }
+        else if (P3IN & BTN_RIGHT) { 
+            CMD_NIBBLE = 0x3u;   // Right
+        }
+        else if (P2IN & BTN_BACK) { 
+            CMD_NIBBLE = 0x7u;   // Backward
+        }
+
+        __no_operation();  // stay in loop, signals repeat automatically
+    }
+}
