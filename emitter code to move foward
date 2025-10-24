@@ -1,0 +1,113 @@
+#include <msp430fr6989.h>
+
+/* ===== User Config ===== */
+// CHANGE THIS TO THE NIBBLE THAT MAKES “FORWARD” WORK
+#define CMD_NIBBLE        0x5u      // sends 0101 pattern (was 0x1 for left)
+#define CYCLES_0_MARK     16u
+#define CYCLES_1_MARK     32u
+#define CYCLES_GAP        25u
+#define FRAME_GAP_MS      60u
+
+/* ===== Clock and Carrier ===== */
+#define SMCLK_HZ          7000000UL
+#define CARRIER_HZ        38000UL
+#define TA0_CCR0_VALUE    91u
+#define GAP_US            658u
+
+/* ===== Globals ===== */
+static volatile unsigned int  toggles_left = 0;
+static volatile unsigned char emitting      = 0;
+static volatile unsigned char bits_sent     = 0;
+
+/* ===== Clock init (~7 MHz) ===== */
+static void clock_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_5;
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3   = DIVS__1 | DIVM__1;
+    CSCTL0_H = 0;
+}
+
+/* ===== GPIO ===== */
+static void gpio_init(void)
+{
+    PM5CTL0 &= ~LOCKLPM5;
+    P3DIR  |=  BIT3;      // P3.3 output → IR LED
+    P3OUT  &= ~BIT3;      // idle LOW
+}
+
+/* ===== TimerA0 → 38 kHz toggling ===== */
+static void timerA0_init(void)
+{
+    TA0CCR0  = TA0_CCR0_VALUE;
+    TA0CCTL0 = 0;
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+/* ===== TimerB0 → 1 µs scheduler ===== */
+static void timerB0_init(void)
+{
+    TB0CTL   = TBSSEL__SMCLK | ID__8 | MC__CONTINUOUS | TBCLR; // 1 MHz ticks
+    TB0CCTL0 = 0;
+}
+
+/* ===== Helper Routines ===== */
+static inline void start_burst_for_bit(unsigned char bit)
+{
+    toggles_left = (unsigned int)((bit ? CYCLES_1_MARK : CYCLES_0_MARK) * 2u);
+    emitting = 1u;
+    TA0CCTL0 = CCIE;
+}
+
+static inline void tb0_schedule_us(unsigned int us)
+{
+    TB0CCR0  = (unsigned int)(TB0R + us);
+    TB0CCTL0 = CCIE;
+}
+
+/* ===== ISRs ===== */
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void TA0_CCR0_ISR(void)
+{
+    if (emitting) {
+        P3OUT ^= BIT3;
+        if (toggles_left && --toggles_left == 0) {
+            emitting  = 0;
+            TA0CCTL0  = 0;
+            P3OUT    &= ~BIT3;
+            tb0_schedule_us(GAP_US);
+        }
+    } else {
+        P3OUT &= ~BIT3;
+    }
+}
+
+#pragma vector = TIMER0_B0_VECTOR
+__interrupt void TB0_CCR0_ISR(void)
+{
+    TB0CCTL0 &= ~CCIFG;
+    if (bits_sent < 4u) {
+        unsigned char bit = (unsigned char)((CMD_NIBBLE >> (3 - bits_sent)) & 1u);
+        bits_sent++;
+        start_burst_for_bit(bit);
+    } else {
+        bits_sent = 0u;
+        tb0_schedule_us((unsigned int)(FRAME_GAP_MS * 1000u));
+    }
+}
+
+/* ===== Main ===== */
+int main(void)
+{
+    clock_init();
+    gpio_init();
+    timerA0_init();
+    timerB0_init();
+    __enable_interrupt();
+
+    tb0_schedule_us(50u);
+
+    for (;;) { __no_operation(); }
+}
