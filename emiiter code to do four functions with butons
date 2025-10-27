@@ -1,11 +1,10 @@
 #include <msp430fr6989.h>
 
 /* ===== User Config ===== */
-static volatile unsigned char CMD_NIBBLE = 0x1u;  // default command (Forward)
 #define CYCLES_0_MARK     16u
 #define CYCLES_1_MARK     32u
 #define CYCLES_GAP        25u
-#define FRAME_GAP_MS      60u
+#define FRAME_GAP_MS      80u
 
 /* ===== Clock and Carrier ===== */
 #define SMCLK_HZ          7000000UL
@@ -13,24 +12,19 @@ static volatile unsigned char CMD_NIBBLE = 0x1u;  // default command (Forward)
 #define TA0_CCR0_VALUE    91u
 #define GAP_US            658u
 
-/* ===== Button Pins (Active HIGH) ===== */
-#define BTN_FWD   BIT3   // P1.3 → Forward
-#define BTN_LEFT  BIT0   // P3.0 → Left
-#define BTN_RIGHT BIT1   // P3.1 → Right
-#define BTN_BACK  BIT3   // P2.3 → Backward
-
 /* ===== Globals ===== */
 static volatile unsigned int  toggles_left = 0;
 static volatile unsigned char emitting      = 0;
 static volatile unsigned char bits_sent     = 0;
+static volatile unsigned char CMD_NIBBLE    = 0;
 
 /* ===== Clock init (~7 MHz) ===== */
 static void clock_init(void)
 {
     WDTCTL = WDTPW | WDTHOLD;
     CSCTL0_H = CSKEY_H;
-    CSCTL1   = DCOFSEL_5;                   // DCO ~7 MHz
-    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK; // SMCLK & MCLK from DCO
+    CSCTL1   = DCOFSEL_5;
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
     CSCTL3   = DIVS__1 | DIVM__1;
     CSCTL0_H = 0;
 }
@@ -40,14 +34,19 @@ static void gpio_init(void)
 {
     PM5CTL0 &= ~LOCKLPM5;
 
-    // IR LED output (P3.3)
-    P3DIR  |=  BIT3;
-    P3OUT  &= ~BIT3;
+    // IR LED
+    P3DIR  |=  BIT3;      // P3.3 output → IR LED
+    P3OUT  &= ~BIT3;      // idle LOW
 
-    // Buttons (no pull-ups since external voltage applied)
-    P1DIR  &= ~BTN_FWD;
-    P3DIR  &= ~(BTN_LEFT | BTN_RIGHT);
-    P2DIR  &= ~BTN_BACK;
+    // Buttons (active high)
+    P1DIR  &= ~BIT3;      // Button 1 input (P1.3)
+    P3DIR  &= ~(BIT0 | BIT1); // Buttons 2 & 3 inputs (P3.0, P3.1)
+    P2DIR  &= ~BIT3;      // Button 4 input (P2.3)
+
+    // Enable pull-downs so lines are LOW when not pressed
+    P1REN  |= BIT3;  P1OUT &= ~BIT3;
+    P3REN  |= (BIT0 | BIT1); P3OUT &= ~(BIT0 | BIT1);
+    P2REN  |= BIT3;  P2OUT &= ~BIT3;
 }
 
 /* ===== TimerA0 → 38 kHz toggling ===== */
@@ -70,7 +69,7 @@ static inline void start_burst_for_bit(unsigned char bit)
 {
     toggles_left = (unsigned int)((bit ? CYCLES_1_MARK : CYCLES_0_MARK) * 2u);
     emitting = 1u;
-    TA0CCTL0 = CCIE;  // enable 38 kHz toggling ISR
+    TA0CCTL0 = CCIE;
 }
 
 static inline void tb0_schedule_us(unsigned int us)
@@ -84,12 +83,12 @@ static inline void tb0_schedule_us(unsigned int us)
 __interrupt void TA0_CCR0_ISR(void)
 {
     if (emitting) {
-        P3OUT ^= BIT3;
+        P3OUT ^= BIT3; // toggle IR LED
         if (toggles_left && --toggles_left == 0) {
             emitting  = 0;
             TA0CCTL0  = 0;
-            P3OUT    &= ~BIT3;       // idle LOW
-            tb0_schedule_us(GAP_US); // quiet gap
+            P3OUT    &= ~BIT3;
+            tb0_schedule_us(GAP_US);
         }
     } else {
         P3OUT &= ~BIT3;
@@ -100,14 +99,13 @@ __interrupt void TA0_CCR0_ISR(void)
 __interrupt void TB0_CCR0_ISR(void)
 {
     TB0CCTL0 &= ~CCIFG;
-
     if (bits_sent < 4u) {
         unsigned char bit = (unsigned char)((CMD_NIBBLE >> (3 - bits_sent)) & 1u);
         bits_sent++;
         start_burst_for_bit(bit);
     } else {
         bits_sent = 0u;
-        tb0_schedule_us((unsigned int)(FRAME_GAP_MS * 1000u));
+        TB0CCTL0 = 0;
     }
 }
 
@@ -120,24 +118,38 @@ int main(void)
     timerB0_init();
     __enable_interrupt();
 
-    tb0_schedule_us(50u); // Start first emission soon
-
     for (;;) 
     {
-        // Button logic (active HIGH)
-        if (P1IN & BTN_FWD) { 
-            CMD_NIBBLE = 0x1u;   // Forward
-        }
-        else if (P3IN & BTN_LEFT) { 
-            CMD_NIBBLE = 0x5u;   // Left
-        }
-        else if (P3IN & BTN_RIGHT) { 
-            CMD_NIBBLE = 0x3u;   // Right
-        }
-        else if (P2IN & BTN_BACK) { 
-            CMD_NIBBLE = 0x7u;   // Backward
+        // Button 1 (P1.3 → 0x1)
+        if (P1IN & BIT3) {
+            CMD_NIBBLE = 0x1u;
+            bits_sent = 0;
+            tb0_schedule_us(50u);
+            __delay_cycles(700000); // debounce delay ~0.1s
         }
 
-        __no_operation();  // stay in loop, signals repeat automatically
+        // Button 2 (P3.0 → 0x3)
+        if (P3IN & BIT0) {
+            CMD_NIBBLE = 0x3u;
+            bits_sent = 0;
+            tb0_schedule_us(50u);
+            __delay_cycles(700000);
+        }
+
+        // Button 3 (P3.1 → 0x5)
+        if (P3IN & BIT1) {
+            CMD_NIBBLE = 0x5u;
+            bits_sent = 0;
+            tb0_schedule_us(50u);
+            __delay_cycles(700000);
+        }
+
+        // Button 4 (P2.3 → 0x7)
+        if (P2IN & BIT3) {
+            CMD_NIBBLE = 0x7u;
+            bits_sent = 0;
+            tb0_schedule_us(50u);
+            __delay_cycles(700000);
+        }
     }
 }
