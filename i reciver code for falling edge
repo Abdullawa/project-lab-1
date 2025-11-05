@@ -1,0 +1,310 @@
+#include <msp430fr6989.h>
+#include <stdint.h>
+
+/* ============================================================
+   Motor Control
+   ============================================================ */
+#define ENA_BIT   BIT7
+#define ENB_BIT   BIT6
+#define IN1_BIT   BIT3
+#define IN2_BIT   BIT0
+#define IN3_BIT   BIT1
+#define IN4_BIT   BIT3
+#define LED_BIT   BIT0
+
+#define SMCLK_HZ     1000000UL
+#define PWM_FREQ_HZ  20000UL
+#define PWM_PERIOD   (SMCLK_HZ / PWM_FREQ_HZ)
+
+#define MOVE_1FT_MS   1100
+#define TURN_90_MS     500
+#define FWD_DUTY_PCT    55
+#define TURN_DUTY_PCT   60
+
+volatile unsigned int dutyA = (PWM_PERIOD * FWD_DUTY_PCT) / 100;
+volatile unsigned int dutyB = (PWM_PERIOD * FWD_DUTY_PCT) / 100;
+volatile unsigned int pwmSub = 0;
+volatile unsigned long ms_ticks = 0;
+volatile unsigned char sleep_flag = 0;
+
+/* ============================================================
+   IR Receiver config
+   ============================================================ */
+#define IR_PIN          BIT1        // P2.1 input (TSOP active-low)
+#define DBG_OUT         BIT4        // P9.4 debug output
+
+#define BIT_THRESHOLD_TICKS  1200u   // 1.2 ms threshold
+#define FRAME_GAP_TICKS     30000u   // 30 ms = new frame
+
+volatile uint8_t  bit_index    = 0;
+volatile uint8_t  nibble       = 0;
+volatile uint8_t  frame_ready  = 0;
+volatile uint16_t last_rise_time  = 0;
+volatile uint16_t last_fall_time  = 0;
+
+/* ============================================================
+   Prototypes
+   ============================================================ */
+static void clock_init(void);
+static void gpio_init(void);
+static void timers_init(void);
+static void sleep_ms(unsigned long ms);
+static void set_duty_pct(unsigned pctA, unsigned pctB);
+static void soft_start(unsigned pctA, unsigned pctB, unsigned ramp_ms);
+static void set_forward(void);
+static void set_reverse(void);
+static void set_turn_right(void);
+static void set_turn_left(void);
+static void stop_motors(void);
+static void hard_brake_ms(unsigned ms);
+static void process_mark(uint16_t low_ticks);
+
+/* ============================================================
+   PWM + millisecond tick
+   ============================================================ */
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void TA0_ISR(void)
+{
+    pwmSub++;
+    if (pwmSub >= PWM_PERIOD) pwmSub = 0;
+    if (pwmSub < dutyA) P2OUT |= ENA_BIT; else P2OUT &= ~ENA_BIT;
+    if (pwmSub < dutyB) P2OUT |= ENB_BIT; else P2OUT &= ~ENB_BIT;
+}
+
+#pragma vector=TIMER0_B0_VECTOR
+__interrupt void TB0_ISR(void)
+{
+    TB0CCR0 += (SMCLK_HZ / 1000U);   // 1 ms scheduling
+    ms_ticks++;
+    sleep_flag = 1;
+    __bic_SR_register_on_exit(LPM0_bits);
+}
+
+/* ============================================================
+   Initialization
+   ============================================================ */
+static void clock_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_5;                   // ~8 MHz
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3   = DIVS__8 | DIVM__1;           // SMCLK = 1 MHz
+    CSCTL0_H = 0;
+}
+
+static void gpio_init(void)
+{
+    PM5CTL0 &= ~LOCKLPM5;
+
+    // --- Motor pins ---
+    P2DIR |= ENA_BIT | ENB_BIT;  P2OUT &= ~(ENA_BIT | ENB_BIT);
+    P1DIR |= IN1_BIT | LED_BIT;  P1OUT &= ~(IN1_BIT | LED_BIT);
+    P3DIR |= IN2_BIT | IN3_BIT;  P3OUT &= ~(IN2_BIT | IN3_BIT);
+    P2DIR |= IN4_BIT;            P2OUT &= ~IN4_BIT;
+
+    // --- IR receiver input (idle high, active low, software-inverted) ---
+    P2DIR  &= ~IR_PIN;
+    P2REN  |=  IR_PIN;
+    P2OUT  |=  IR_PIN;           // pull-up, idle high
+    P2IE   &= ~IR_PIN;           // disable during setup
+    P2IFG  &= ~IR_PIN;           // clear any pending flag
+    P2IES  &= ~IR_PIN;           // rising-edge first  (we’ll treat rising as “IR starts”)
+    __delay_cycles(5000);        // wait ~5 ms for TSOP to stabilize
+    P2IE   |=  IR_PIN;           // enable interrupt
+
+
+    // --- Debug output ---
+    P9DIR |= DBG_OUT;
+    P9OUT &= ~DBG_OUT;
+}
+
+static void timers_init(void)
+{
+    // TA0: 20 kHz PWM
+    TA0CCR0  = PWM_PERIOD - 1;
+    TA0CCTL0 = CCIE;
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+
+    // TB0: continuous 1 MHz for IR timing + ms tick
+    TB0CTL   = TBSSEL__SMCLK | MC__CONTINUOUS | TBCLR;
+    TB0CCR0  = TB0R + (SMCLK_HZ / 1000U);
+    TB0CCTL0 = CCIE;
+}
+
+/* ============================================================
+   Utility + Motor helpers
+   ============================================================ */
+static void sleep_ms(unsigned long ms)
+{
+    unsigned long target = ms_ticks + ms;
+    while ((long)(target - ms_ticks) > 0)
+        __bis_SR_register(LPM0_bits | GIE);
+}
+
+static void set_duty_pct(unsigned pctA, unsigned pctB)
+{
+    if (pctA > 100) pctA = 100;
+    if (pctB > 100) pctB = 100;
+    dutyA = (PWM_PERIOD * pctA) / 100;
+    dutyB = (PWM_PERIOD * pctB) / 100;
+}
+
+static void soft_start(unsigned pctA, unsigned pctB, unsigned ramp_ms)
+{
+    unsigned i, steps = 10, a, b;
+    for (i = 0; i <= steps; i++) {
+        a = (pctA * i) / steps;
+        b = (pctB * i) / steps;
+        set_duty_pct(a, b);
+        sleep_ms(ramp_ms / steps);
+    }
+}
+
+static void set_forward(void)
+{
+    P1OUT |= IN1_BIT;    P3OUT &= ~IN2_BIT;
+    P3OUT |= IN3_BIT;    P2OUT &= ~IN4_BIT;
+}
+static void set_reverse(void)
+{
+    P1OUT &= ~IN1_BIT;   P3OUT |= IN2_BIT;
+    P3OUT &= ~IN3_BIT;   P2OUT |= IN4_BIT;
+}
+static void set_turn_right(void)
+{
+    P1OUT |= IN1_BIT;    P3OUT &= ~IN2_BIT;
+    P3OUT &= ~IN3_BIT;   P2OUT |= IN4_BIT;
+}
+static void set_turn_left(void)
+{
+    P1OUT &= ~IN1_BIT;   P3OUT |= IN2_BIT;
+    P3OUT |= IN3_BIT;    P2OUT &= ~IN4_BIT;
+}
+static void stop_motors(void)
+{
+    P1OUT &= ~IN1_BIT;
+    P3OUT &= ~(IN2_BIT | IN3_BIT);
+    P2OUT &= ~IN4_BIT;
+    set_duty_pct(0,0);
+}
+static void hard_brake_ms(unsigned ms)
+{
+    P1OUT |= IN1_BIT; P3OUT |= IN2_BIT;
+    P3OUT |= IN3_BIT; P2OUT |= IN4_BIT;
+    set_duty_pct(100,100);
+    sleep_ms(ms);
+    stop_motors();
+}
+
+/* ============================================================
+   IR decoding
+   ============================================================ */
+static void process_mark(uint16_t low_ticks)
+{
+    if (low_ticks < 300u || low_ticks > 3000u) return;
+
+    nibble <<= 1;
+    if (low_ticks < BIT_THRESHOLD_TICKS) nibble |= 0;
+    else nibble |= 1;
+
+    P9OUT |= DBG_OUT; __delay_cycles(800); P9OUT &= ~DBG_OUT;
+
+    bit_index++;
+    if (bit_index >= 4u) { frame_ready = 1; bit_index = 0; }
+}
+
+/* ============================================================
+   ISR for IR edges
+   ============================================================ */
+#pragma vector=PORT2_VECTOR
+__interrupt void PORT2_ISR(void)
+{
+    uint16_t now = TB0R;
+
+    if (!(P2IES & IR_PIN)) {
+        // Rising edge (IR burst started  — line went HIGH after inversion)
+        uint16_t high_width = now - last_fall_time;
+        last_rise_time = now;
+
+        if (high_width > FRAME_GAP_TICKS) {
+            bit_index = 0;
+            nibble = 0;
+        }
+    } else {
+        // Falling edge (IR burst ended)
+        uint16_t low_width = now - last_rise_time;
+        last_fall_time = now;
+        process_mark(low_width);
+    }
+
+    P2IES ^= IR_PIN;      // alternate next edge
+    P2IFG &= ~IR_PIN;     // clear flag LAST
+}
+     
+
+/* ============================================================
+   Main loop
+   ============================================================ */
+int main(void)
+{
+    clock_init();
+    gpio_init();
+    timers_init();
+    set_duty_pct(0,0);
+    __enable_interrupt();
+
+    while (1)
+    {
+        if (frame_ready)
+        {
+            frame_ready = 0;
+
+            P9OUT |= DBG_OUT; __delay_cycles(8000); P9OUT &= ~DBG_OUT;
+
+            switch (nibble)
+            {
+                case 0x1:
+                    set_forward();
+                    soft_start(FWD_DUTY_PCT,FWD_DUTY_PCT,200);
+                    sleep_ms(MOVE_1FT_MS);
+                    hard_brake_ms(150);
+                    stop_motors();
+                    break;
+
+                case 0x3:
+                    set_turn_right();
+                    soft_start(TURN_DUTY_PCT,TURN_DUTY_PCT,200);
+                    sleep_ms(TURN_90_MS);
+                    hard_brake_ms(150);
+                    stop_motors();
+                    break;
+
+                case 0x5:
+                    set_turn_left();
+                    soft_start(TURN_DUTY_PCT,TURN_DUTY_PCT,200);
+                    sleep_ms(TURN_90_MS);
+                    hard_brake_ms(150);
+                    stop_motors();
+                    break;
+
+                case 0x7:
+                    set_reverse();
+                    soft_start(FWD_DUTY_PCT,FWD_DUTY_PCT,200);
+                    sleep_ms(MOVE_1FT_MS);
+                    hard_brake_ms(150);
+                    stop_motors();
+                    break;
+
+                case 0x9:
+                    hard_brake_ms(150);
+                    stop_motors();
+                    break;
+
+                default:
+                    break;
+            }
+        }
+        __no_operation();
+    }
+}
