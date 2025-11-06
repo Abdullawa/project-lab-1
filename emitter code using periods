@@ -1,0 +1,112 @@
+#include <msp430fr6989.h>
+
+/* ============================================================
+   IR Period-Based Emitter  (P3.3 → IR LED, 38 kHz)
+   Buttons: P1.3 = FWD, P3.0 = LEFT, P3.1 = RIGHT, P2.3 = REV
+   ============================================================ */
+
+/* ---- Pulse timing (microseconds) ---- */
+#define PERIOD_FWD_US   400u
+#define PERIOD_LEFT_US  600u
+#define PERIOD_RIGHT_US 800u
+#define PERIOD_REV_US   1000u
+#define GAP_US          5000u       // gap between bursts
+
+/* ---- Carrier setup ---- */
+#define SMCLK_HZ        7000000UL
+#define CARRIER_HZ      38000UL
+#define TA0_CCR0_VAL    91u         // ≈ 38 kHz at 7 MHz SMCLK
+
+/* ============================================================
+   Globals
+   ============================================================ */
+static volatile unsigned int toggles_left = 0;
+static volatile unsigned char emitting = 0;
+
+/* ============================================================
+   Init Routines
+   ============================================================ */
+static void clock_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_5;                           // ~7 MHz DCO
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3   = DIVS__1 | DIVM__1;                   // SMCLK = 7 MHz
+    CSCTL0_H = 0;
+}
+
+static void gpio_init(void)
+{
+    PM5CTL0 &= ~LOCKLPM5;                           // unlock GPIO
+
+    // IR LED  (P3.3)
+    P3DIR  |=  BIT3;
+    P3OUT  &= ~BIT3;
+
+    // Buttons (active-high)
+    P1DIR  &= ~BIT3;
+    P3DIR  &= ~(BIT0 | BIT1);
+    P2DIR  &= ~BIT3;
+
+    // Pull-downs keep LOW when released
+    P1REN  |= BIT3;  P1OUT &= ~BIT3;
+    P3REN  |= (BIT0 | BIT1); P3OUT &= ~(BIT0 | BIT1);
+    P2REN  |= BIT3;  P2OUT &= ~BIT3;
+}
+
+/* ---- TimerA0 → 38 kHz carrier toggler ---- */
+static void timerA0_init(void)
+{
+    TA0CCR0  = TA0_CCR0_VAL;
+    TA0CCTL0 = 0;
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+/* ============================================================
+   Helpers
+   ============================================================ */
+static inline void delay_us(unsigned int us)
+{
+    while (us--)
+        __delay_cycles(7);     // 1 µs at 7 MHz
+}
+
+/* Emit one IR burst (carrier toggled for 'pulse_us') */
+static void send_pulse(unsigned int pulse_us)
+{
+    unsigned int cycles = (CARRIER_HZ * pulse_us) / 1000000UL; // number of 38 kHz cycles
+    toggles_left = cycles * 2u;                                // two toggles per cycle
+    emitting = 1;
+
+    while (toggles_left--)
+    {
+        P3OUT ^= BIT3;
+        delay_us(13);     // half period ≈ 13 µs → ~38 kHz
+    }
+
+    P3OUT &= ~BIT3;       // ensure off
+    emitting = 0;
+}
+
+/* ============================================================
+   Main
+   ============================================================ */
+int main(void)
+{
+    clock_init();
+    gpio_init();
+    timerA0_init();
+    __enable_interrupt();
+
+    for (;;)
+    {
+        if (P1IN & BIT3)        send_pulse(PERIOD_FWD_US);    // Forward
+        else if (P2IN & BIT3)   send_pulse(PERIOD_REV_US);    // Reverse
+        else if (P3IN & BIT0)   send_pulse(PERIOD_LEFT_US);   // Left
+        else if (P3IN & BIT1)   send_pulse(PERIOD_RIGHT_US);  // Right
+        else                    /* no button pressed */;
+
+        delay_us(GAP_US);       // gap before next burst
+    }
+}
