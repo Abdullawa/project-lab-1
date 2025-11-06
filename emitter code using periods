@@ -6,11 +6,12 @@
    ============================================================ */
 
 /* ---- Pulse timing (microseconds) ---- */
-#define PERIOD_FWD_US   400u
-#define PERIOD_LEFT_US  600u
-#define PERIOD_RIGHT_US 800u
-#define PERIOD_REV_US   1000u
-#define GAP_US          5000u       // gap between bursts
+#define PERIOD_FWD_US   600u
+#define PERIOD_LEFT_US  900u
+#define PERIOD_RIGHT_US 1200u
+#define PERIOD_REV_US   1500u
+#define GAP_US          7500u
+
 
 /* ---- Carrier setup ---- */
 #define SMCLK_HZ        7000000UL
