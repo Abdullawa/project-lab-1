@@ -1,0 +1,123 @@
+#include <msp430fr6989.h>
+
+#define SMCLK_HZ 8000000UL
+#define BAUDRATE 9600UL
+
+/* ============================================================
+   Function Prototypes
+   ============================================================ */
+void clock_init(void);
+void gpio_init(void);
+void timer0_init_38kHz(void);
+void uart_init(void);
+void uart_send_char(char c);
+void delay_ms(unsigned int ms);
+
+/* ============================================================
+   Main
+   ============================================================ */
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;          // Stop watchdog timer
+
+    clock_init();
+    gpio_init();
+    timer0_init_38kHz();
+    uart_init();
+
+    __enable_interrupt();
+
+    while (1)
+    {
+        uart_send_char('f');           // Send test character repeatedly
+        P1OUT ^= BIT0;                 // Blink LED for TX heartbeat
+        delay_ms(200);                 // 200 ms delay between sends
+    }
+}
+
+/* ============================================================
+   Clock Initialization  (8 MHz DCO)
+   ============================================================ */
+void clock_init(void)
+{
+    CSCTL0_H = CSKEY_H;                        // Unlock CS registers
+    CSCTL1 = DCOFSEL_5;                        // DCO = ~8 MHz
+    CSCTL2 = SELS__DCOCLK | SELM__DCOCLK;      // SMCLK & MCLK = DCO
+    CSCTL3 = DIVS__1 | DIVM__1;                // No clock division
+    CSCTL0_H = 0;                              // Lock CS registers
+}
+
+/* ============================================================
+   GPIO Setup
+   ============================================================ */
+void gpio_init(void)
+{
+    PM5CTL0 &= ~LOCKLPM5;   // Unlock GPIO (FR-series requirement)
+
+    // UART pins: P4.2 (TXD) and P4.3 (RXD)
+    P4SEL0 |= BIT2 | BIT3;
+    P4SEL1 &= ~(BIT2 | BIT3);
+
+    // 38 kHz carrier output: P3.3
+    P3DIR  |= BIT3;         // Output
+    P3OUT  &= ~BIT3;        // Start LOW
+    P3SEL0 &= ~BIT3;        // Force plain GPIO
+    P3SEL1 &= ~BIT3;
+
+    // Debug / TX heartbeat LED on P1.0
+    P1DIR  |= BIT0;
+    P1OUT  &= ~BIT0;
+}
+
+/* ============================================================
+   Timer0_A0 Interrupt Setup → 38 kHz Toggle on P3.3
+   ============================================================ */
+void timer0_init_38kHz(void)
+{
+    // Frequency = SMCLK / (2 * TA0CCR0)
+    // For 38 kHz at 8 MHz: TA0CCR0 = 8e6 / (2 * 38000) ≈ 105
+    TA0CCR0  = 93 - 1;
+    TA0CCTL0 = CCIE;                         // Enable interrupt
+    TA0CTL   = TASSEL__SMCLK | MC__UP | TACLR; // SMCLK source, up mode
+}
+
+/* ============================================================
+   UART Initialization (UCA0 @ 9600 baud)
+   ============================================================ */
+void uart_init(void)
+{
+    UCA0CTLW0 = UCSWRST;           // Hold eUSCI in reset
+    UCA0CTLW0 |= UCSSEL__SMCLK;    // Clock source = SMCLK (8 MHz)
+
+    UCA0BRW   = 833;               // 8 MHz / 9600 ≈ 833
+    UCA0MCTLW = 0;                 // No modulation
+
+    UCA0CTLW0 &= ~UCSWRST;         // Release eUSCI for operation
+}
+
+/* ============================================================
+   UART Transmit Function
+   ============================================================ */
+void uart_send_char(char c)
+{
+    while (!(UCA0IFG & UCTXIFG));  // Wait until TX buffer ready
+    UCA0TXBUF = c;                 // Load data into TX buffer
+}
+
+/* ============================================================
+   Millisecond Delay (uses CPU delay cycles)
+   ============================================================ */
+void delay_ms(unsigned int ms)
+{
+    while (ms--)
+        __delay_cycles(8000);      // 1 ms delay at 8 MHz
+}
+
+/* ============================================================
+   Timer0_A0 ISR → Toggle P3.3 for 38 kHz
+   ============================================================ */
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer0_A0_ISR(void)
+{
+    P3OUT ^= BIT3;                 // Toggle P3.3 → 38 kHz square wave
+}
