@@ -1,0 +1,228 @@
+#include <msp430fr6989.h>
+#include <stdint.h>
+
+/* ===== Pin map (your wiring) ===== */
+#define ENA BIT7    /* P2.7 -> L298N ENA */
+#define ENB BIT6    /* P2.6 -> L298N ENB */
+#define IN1 BIT3    /* P1.3 -> IN1  (Right A) */
+#define IN2 BIT0    /* P3.0 -> IN2  (Right B) */
+#define IN3 BIT1    /* P3.1 -> IN3  (Left  A) */
+#define IN4 BIT3    /* P2.3 -> IN4  (Left  B) */
+#define IR  BIT1    /* P2.1 -> TSOP38238 OUT (active-LOW) */
+#define LED BIT0    /* P1.0 -> onboard LED */
+
+/* ===== Timing (1 MHz timebase) ===== */
+#define FRAME_RESET_US   3000u      /* gap >3 ms => new 4-bit frame */
+#define IDLE_STOP_US     20000u     /* silence >20 ms => stop/LED off */
+#define CMD_HOLD_US      15000u     /* keep last cmd alive for 15 ms */
+#define WIDTH_MIN_US     100u       /* ignore tiny glitches */
+#define WIDTH_MAX_US     3000u      /* ignore absurd widths */
+
+/* ===== Globals ===== */
+static volatile uint16_t last_fall = 0;
+static volatile uint16_t last_rise = 0;
+static volatile uint16_t last_activity = 0;
+static volatile uint8_t  expect_falling = 1;
+
+static volatile uint16_t widths[4];
+static volatile uint8_t  wcount = 0;
+
+static volatile uint8_t  last_cmd = 0;       /* 0x1,0x3,0x5,0x7 or 0x00 */
+static volatile uint16_t last_cmd_time = 0;   /* TB0R when last valid cmd decoded */
+
+/* ===== Motor helpers ===== */
+static void motors_enable(void)  { P2OUT |=  (ENA | ENB); }
+static void motors_disable(void) { P2OUT &= ~(ENA | ENB); }
+
+static void set_forward(void) {
+    /* Right fwd: IN1=1,IN2=0 ; Left fwd: IN3=1,IN4=0 */
+    P1OUT |=  IN1;  P3OUT &= ~IN2;
+    P3OUT |=  IN3;  P2OUT &= ~IN4;
+}
+static void set_reverse(void) {
+    /* Right rev: IN1=0,IN2=1 ; Left rev: IN3=0,IN4=1 */
+    P1OUT &= ~IN1;  P3OUT |=  IN2;
+    P3OUT &= ~IN3;  P2OUT |=  IN4;
+}
+static void set_turn_left(void) {
+    /* Right fwd, Left rev */
+    P1OUT |=  IN1;  P3OUT &= ~IN2;   /* right fwd */
+    P3OUT &= ~IN3;  P2OUT |=  IN4;   /* left  rev */
+}
+static void set_turn_right(void) {
+    /* Right rev, Left fwd */
+    P1OUT &= ~IN1;  P3OUT |=  IN2;   /* right rev */
+    P3OUT |=  IN3;  P2OUT &= ~IN4;   /* left  fwd */
+}
+
+static void stop_all(void) {
+    motors_disable();
+    P1OUT &= ~LED;
+    last_cmd = 0x00;
+}
+
+/* ===== Apply command ===== */
+static void apply_command(uint8_t cmd) {
+    last_cmd = cmd;
+    last_cmd_time = TB0R;
+    P1OUT |= LED; /* indicate "button held" */
+
+    switch (cmd) {
+        case 0x01: set_forward();    motors_enable(); break;  /* forward  */
+        case 0x03: set_turn_left();  motors_enable(); break;  /* left     */
+        case 0x05: set_turn_right(); motors_enable(); break;  /* right    */
+        case 0x07: set_reverse();    motors_enable(); break;  /* backward */
+        default:   motors_disable();                         break;
+    }
+}
+
+/* ===== Decode 4 widths using min-max threshold =====
+   thresh = (min + max)/2 ; classify: w >= thresh => '1', else '0'.
+   This correctly handles 1-long/3-short (0001) and 3-long/1-short (0111).
+*/
+static void decode_and_apply(void) {
+    uint16_t minw, maxw, thresh;
+    uint8_t  i;
+    uint8_t  nib = 0;
+
+    minw = 0xFFFF;
+    maxw = 0;
+
+    /* clamp & find min/max */
+    for (i = 0; i < 4; i++) {
+        uint16_t w = widths[i];
+        if (w < WIDTH_MIN_US) w = WIDTH_MIN_US;
+        if (w > WIDTH_MAX_US) w = WIDTH_MAX_US;
+        if (w < minw) minw = w;
+        if (w > maxw) maxw = w;
+    }
+
+    /* avoid divide; mid-threshold by averaging */
+    thresh = (uint16_t)((minw + maxw) / 2u);
+
+    /* Build nibble MSB->LSB in arrival order */
+    for (i = 0; i < 4; i++) {
+        uint8_t bit = (widths[i] >= thresh) ? 1u : 0u; /* >= to be robust when equal */
+        nib = (uint8_t)((nib << 1) | bit);
+    }
+
+    if (nib == 0x01 || nib == 0x03 || nib == 0x05 || nib == 0x07) {
+        apply_command(nib);
+    } else {
+        motors_disable();
+    }
+
+    wcount = 0;
+}
+
+/* ===== Clock/GPIO/Timer ===== */
+static void clocks(void){
+    CSCTL0_H = CSKEY_H;
+    CSCTL1   = DCOFSEL_1;                    /* ~1 MHz */
+    CSCTL2   = SELS__DCOCLK | SELM__DCOCLK;
+    CSCTL3   = DIVS__1 | DIVM__1;
+    CSCTL0_H = 0;
+}
+static void gpio(void){
+    PM5CTL0 &= ~LOCKLPM5;
+
+    /* Force GPIO (no peripherals on these pins) */
+    P1SEL0 &= ~(IN1 | LED);  P1SEL1 &= ~(IN1 | LED);
+    P2SEL0 &= ~(IR | ENA | ENB | IN4);
+    P2SEL1 &= ~(IR | ENA | ENB | IN4);
+    P3SEL0 &= ~(IN2 | IN3);  P3SEL1 &= ~(IN2 | IN3);
+
+    /* Outputs */
+    P1DIR |= IN1 | LED;    P1OUT &= ~LED;
+    P3DIR |= IN2 | IN3;
+    P2DIR |= IN4 | ENA | ENB;
+
+    /* Default orientation: forward; EN off until command arrives */
+    set_forward();
+    motors_disable();
+
+    /* TSOP input (idle HIGH, active LOW) */
+    P2DIR &= ~IR;
+    P2REN |=  IR;
+    P2OUT |=  IR;
+    P2IES |=  IR;          /* start on falling */
+    P2IFG &= ~IR;
+    P2IE  |=  IR;
+}
+static void timers(void){
+    TB0CTL = TBSSEL__SMCLK | MC__CONTINUOUS | TBCLR; /* 1 MHz free-run timer */
+}
+
+/* ===== ISR: edges on P2.1 ===== */
+#pragma vector=PORT2_VECTOR
+__interrupt void PORT2_ISR(void)
+{
+    uint16_t now = TB0R;
+    uint16_t low_us, gap_us;
+
+    P2IFG &= ~IR;
+    last_activity = now;
+
+    if (expect_falling) {
+        last_fall = now;           /* LOW starts */
+        expect_falling = 0;
+        P2IES &= ~IR;              /* next: rising */
+    } else {
+        low_us = now - last_fall;                   /* LOW duration (mark) */
+        gap_us = (last_rise) ? (last_fall - last_rise) : 0;
+
+        if (gap_us > FRAME_RESET_US) {
+            wcount = 0;            /* start new 4-bit frame */
+        }
+
+        /* accept reasonable mark widths */
+        if (low_us >= WIDTH_MIN_US && low_us <= WIDTH_MAX_US) {
+            if (wcount < 4) {
+                widths[wcount++] = low_us;
+            } else {
+                /* sliding window: keep most recent 4 marks */
+                widths[0] = widths[1];
+                widths[1] = widths[2];
+                widths[2] = widths[3];
+                widths[3] = low_us;
+                wcount = 4;
+            }
+        }
+
+        if (wcount == 4) {
+            decode_and_apply();
+        }
+
+        last_rise = now;           /* remember end of LOW */
+        expect_falling = 1;
+        P2IES |= IR;               /* next: falling */
+    }
+}
+
+/* ===== Main ===== */
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    clocks();
+    gpio();
+    timers();
+    __enable_interrupt();
+
+    for (;;) {
+        uint16_t now = TB0R;
+
+        /* Stop motors + LED if IR has been quiet for too long */
+        if ((uint16_t)(now - last_activity) > IDLE_STOP_US) {
+            stop_all();
+        } else {
+            /* Keep action only if command was seen recently */
+            if ((last_cmd == 0x01 || last_cmd == 0x03 || last_cmd == 0x05 || last_cmd == 0x07) &&
+                (uint16_t)(now - last_cmd_time) <= CMD_HOLD_US) {
+                /* keep driving; ISR already set direction+EN */
+            } else {
+                stop_all();
+            }
+        }
+        __low_power_mode_0();
+    }
+}
