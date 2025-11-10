@@ -42,11 +42,13 @@ static void gpio_init(void)
     P1DIR  &= ~BIT3;      // Button 1 input (P1.3)
     P3DIR  &= ~(BIT0 | BIT1); // Buttons 2 & 3 inputs (P3.0, P3.1)
     P2DIR  &= ~BIT3;      // Button 4 input (P2.3)
+    P2DIR  &= ~BIT2;
 
     // Enable pull-downs so lines are LOW when not pressed
     P1REN  |= BIT3;  P1OUT &= ~BIT3;
     P3REN  |= (BIT0 | BIT1); P3OUT &= ~(BIT0 | BIT1);
     P2REN  |= BIT3;  P2OUT &= ~BIT3;
+    P2REN  |= BIT2;  P2OUT &= ~BIT2;
 }
 
 /* ===== TimerA0 → 38 kHz toggling ===== */
@@ -147,6 +149,14 @@ int main(void)
         // Button 4 (P2.3 → 0x7)
         if (P2IN & BIT3) {
             CMD_NIBBLE = 0x7u;
+            bits_sent = 0;
+            tb0_schedule_us(50u);
+            __delay_cycles(700000);
+        }
+
+        // Button 4 (P2.3 → 0x7)
+        if (P2IN & BIT2) {
+            CMD_NIBBLE = 0x9u;
             bits_sent = 0;
             tb0_schedule_us(50u);
             __delay_cycles(700000);
