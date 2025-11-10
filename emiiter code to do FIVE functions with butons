@@ -154,7 +154,7 @@ int main(void)
             __delay_cycles(700000);
         }
 
-        // Button 4 (P2.3 → 0x7)
+        // Button 4 (P2.3 → 0x9)
         if (P2IN & BIT2) {
             CMD_NIBBLE = 0x9u;
             bits_sent = 0;
