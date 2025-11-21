@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 /* ===== Pin map (your wiring) ===== */
-#define ENA BIT7    /* P2.7 -> L298N ENA */
+#define ENA BIT3    /* P3.3 -> L298N ENA */
 #define ENB BIT6    /* P2.6 -> L298N ENB */
 #define IN1 BIT3    /* P1.3 -> IN1  (Right A) */
 #define IN2 BIT0    /* P3.0 -> IN2  (Right B) */
@@ -31,8 +31,10 @@ static volatile uint8_t  last_cmd = 0;       /* 0x1,0x3,0x5,0x7 or 0x00 */
 static volatile uint16_t last_cmd_time = 0;   /* TB0R when last valid cmd decoded */
 
 /* ===== Motor helpers ===== */
-static void motors_enable(void)  { P2OUT |=  (ENA | ENB); }
-static void motors_disable(void) { P2OUT &= ~(ENA | ENB); }
+static void motors_enable(void)  { P3OUT |= ENA;  P2OUT |= ENB; }
+static void motors_disable(void) { P3OUT &= ~ENA; P2OUT &= ~ENB; }
+
+
 
 static void set_forward(void) {
     /* Right fwd: IN1=1,IN2=0 ; Left fwd: IN3=1,IN4=0 */
@@ -133,32 +135,46 @@ static void clocks(void){
     CSCTL3   = DIVS__1 | DIVM__1;
     CSCTL0_H = 0;
 }
+
 static void gpio(void){
-    PM5CTL0 &= ~LOCKLPM5;
+    PM5CTL0 &= ~LOCKLPM5;  // Unlock GPIO
 
-    /* Force GPIO (no peripherals on these pins) */
-    P1SEL0 &= ~(IN1 | LED);  P1SEL1 &= ~(IN1 | LED);
-    P2SEL0 &= ~(IR | ENA | ENB | IN4);
-    P2SEL1 &= ~(IR | ENA | ENB | IN4);
-    P3SEL0 &= ~(IN2 | IN3);  P3SEL1 &= ~(IN2 | IN3);
+    /* ==== Pin function selection (GPIO mode) ==== */
+    // P1 pins
+    P1SEL0 &= ~(IN1 | LED);  
+    P1SEL1 &= ~(IN1 | LED);
 
-    /* Outputs */
-    P1DIR |= IN1 | LED;    P1OUT &= ~LED;
-    P3DIR |= IN2 | IN3;
-    P2DIR |= IN4 | ENA | ENB;
+    // P2 pins
+    P2SEL0 &= ~(IR | ENB | IN4);       
+    P2SEL1 &= ~(IR | ENB | IN4);
 
-    /* Default orientation: forward; EN off until command arrives */
+    // P3 pins
+    P3SEL0 &= ~(IN2 | IN3 | ENA);      
+    P3SEL1 &= ~(IN2 | IN3 | ENA);
+
+    /* ==== Direction setup ==== */
+    P1DIR |= IN1 | LED;          // Right motor input + LED output
+    P2DIR |= IN4 | ENB;          // Left motor input + Left enable
+    P3DIR |= IN2 | IN3 | ENA;    // Right motor input + Left motor input + Right enable
+
+    /* ==== Default output state ==== */
+    P1OUT &= ~LED;               // LED off
+    P2OUT &= ~ENB;               // Left motor disabled
+    P3OUT &= ~ENA;               // Right motor disabled
+
+    /* ==== Set initial motor direction (forward) ==== */
     set_forward();
     motors_disable();
 
-    /* TSOP input (idle HIGH, active LOW) */
-    P2DIR &= ~IR;
-    P2REN |=  IR;
-    P2OUT |=  IR;
-    P2IES |=  IR;          /* start on falling */
-    P2IFG &= ~IR;
-    P2IE  |=  IR;
+    /* ==== IR input setup (active LOW, pull-up) ==== */
+    P2DIR &= ~IR;   // input
+    P2REN |= IR;    // enable pull-up/pull-down resistor
+    P2OUT |= IR;    // pull-up
+    P2IES |= IR;    // start on falling edge
+    P2IFG &= ~IR;   // clear flag
+    P2IE  |= IR;    // enable interrupt
 }
+
 static void timers(void){
     TB0CTL = TBSSEL__SMCLK | MC__CONTINUOUS | TBCLR; /* 1 MHz free-run timer */
 }
