@@ -1,0 +1,30 @@
+#include <msp430.h>
+//Modified for MSP430FR6989
+//Servo control on P2.7
+//Based on drselim MSP430 & SG90 Servo example
+
+void main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;   // stop watchdog timer
+   
+    // Disable the GPIO power-on default high-impedance mode
+    PM5CTL0 &= ~LOCKLPM5;       // CRITICAL for FR6989!
+   
+    // Configure P2.7 for PWM output using Timer B0
+    P2DIR |= BIT7;              // Set P2.7 as output
+    P2SEL0 |= BIT7;             // Select primary peripheral function
+    P2SEL1 &= ~BIT7;            // P2.7 = TB0.6 output
+   
+    // Configure Timer B0 for PWM
+    TB0CCR0 = 20000 - 1;        // PWM period (20ms at 1MHz)
+    TB0CCTL6 = OUTMOD_7;        // CCR6 reset/set mode
+    TB0CTL = TBSSEL__SMCLK | MC__UP | TBCLR;  // SMCLK, up mode, clear timer
+   
+    
+        TB0CCR6 = 1600;          // Move to 0 degrees
+        __delay_cycles(1400000);
+       
+        TB0CCR6 = 2600;         // Move to ~200 degrees
+        __delay_cycles(1400000);
+    
+}
